@@ -1,0 +1,5 @@
+# dogfood: keep the tool's own build context clean
+.git
+.github
+*.log
+dist/
