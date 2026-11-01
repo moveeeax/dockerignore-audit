@@ -1,9 +1,11 @@
 BIN := dist/dockerignore-audit
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS := -X main.version=$(VERSION)
 
 .PHONY: build test vet fmt lint clean
 
 build:
-	go build -o $(BIN) ./cmd/dockerignore-audit
+	go build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/dockerignore-audit
 
 test:
 	go test ./...
