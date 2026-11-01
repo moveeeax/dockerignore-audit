@@ -8,11 +8,25 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/moveeeax/dockerignore-audit/internal/audit"
 )
 
-var version = "0.1.0"
+// version is set at build time with -ldflags "-X main.version=<tag>".
+// When it is empty, the module version recorded by "go install ...@vX.Y.Z"
+// is used instead.
+var version = ""
+
+func resolveVersion() string {
+	if version != "" {
+		return version
+	}
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "dev"
+}
 
 func main() {
 	path := flag.String("path", ".", "build-context directory to audit")
@@ -22,7 +36,7 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Println(version)
+		fmt.Println(resolveVersion())
 		return
 	}
 
