@@ -52,7 +52,7 @@ Exit code is `1` when there are findings (or, with `-danger-only`, when there ar
 
 Anything already excluded by your `.dockerignore` is not reported. Patterns are evaluated with Docker's own rules ([docs](https://docs.docker.com/build/concepts/context/#dockerignore-files), [moby/patternmatcher](https://github.com/moby/patternmatcher)): they are anchored to the root of the build context, `*` and `?` stay within one path segment, `**` matches any number of directories, excluding a directory excludes everything under it, and the last matching line wins, so `!` re-includes.
 
-That anchoring is the trap this tool catches: `*.pem` or `.env` in `.dockerignore` only exclude top-level files, so `config/tls.pem` or `app/.env` still reach the builder. Suggestions therefore use the `**/` form (`**/*.pem`, `**/.env`), which matches at any depth.
+That anchoring is the trap this tool catches: `*.pem` or `.env` in `.dockerignore` only exclude top-level files, so `config/tls.pem` or `app/.env` still reach the builder. Suggestions therefore use the `**/` form, which matches at any depth: the file's extension for key formats (`**/*.pem`, `**/*.pfx`) and its exact name for named files (`**/.env`, `**/.env.local`).
 
 ## In CI
 

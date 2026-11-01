@@ -227,28 +227,31 @@ func compilePattern(pat string) (*regexp.Regexp, error) {
 	var b strings.Builder
 	b.WriteString("^")
 	inClass := false
-	for i := 0; i < len(pat); i++ {
-		c := pat[i]
+	// Walk runes, not bytes: a multi-byte UTF-8 character must be quoted as
+	// one unit or non-ASCII patterns never match.
+	rs := []rune(pat)
+	for i := 0; i < len(rs); i++ {
+		c := rs[i]
 		switch {
 		case inClass:
 			if c == ']' {
 				inClass = false
 			}
-			if c == '\\' && i+1 < len(pat) {
+			if c == '\\' && i+1 < len(rs) {
 				i++
-				b.WriteString(regexp.QuoteMeta(pat[i : i+1]))
+				b.WriteString(regexp.QuoteMeta(string(rs[i])))
 				continue
 			}
-			b.WriteByte(c)
+			b.WriteRune(c)
 		case c == '[':
 			inClass = true
-			b.WriteByte(c)
-		case c == '*' && i+1 < len(pat) && pat[i+1] == '*':
+			b.WriteRune(c)
+		case c == '*' && i+1 < len(rs) && rs[i+1] == '*':
 			i++
-			if i+1 < len(pat) && pat[i+1] == '/' {
+			if i+1 < len(rs) && rs[i+1] == '/' {
 				i++
 			}
-			if i+1 == len(pat) {
+			if i+1 == len(rs) {
 				b.WriteString(".*")
 			} else {
 				b.WriteString("(.*/)?")
@@ -257,9 +260,9 @@ func compilePattern(pat string) (*regexp.Regexp, error) {
 			b.WriteString("[^/]*")
 		case c == '?':
 			b.WriteString("[^/]")
-		case c == '\\' && i+1 < len(pat):
+		case c == '\\' && i+1 < len(rs):
 			i++
-			b.WriteString(regexp.QuoteMeta(pat[i : i+1]))
+			b.WriteString(regexp.QuoteMeta(string(rs[i])))
 		default:
 			b.WriteString(regexp.QuoteMeta(string(c)))
 		}

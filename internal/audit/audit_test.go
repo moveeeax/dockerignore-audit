@@ -197,6 +197,13 @@ func TestIgnoredDockerSemantics(t *testing.T) {
 		// "." is ignored for historical reasons; "#" is a comment only in column 1.
 		{[]string{"."}, "main.go", false},
 		{[]string{"[ab].key"}, "a.key", true},
+		// Non-ASCII names are matched rune by rune.
+		{[]string{"café.pem"}, "café.pem", true},
+		{[]string{"данные"}, "данные/x", true},
+		{[]string{"*.pem", "!café.pem"}, "café.pem", false},
+		{[]string{"дан?ые"}, "данные", true},
+		{[]string{"[дж]анные"}, "данные", true},
+		{[]string{"**/секрет.key"}, "a/секрет.key", true},
 		{[]string{"[ab].key"}, "c.key", false},
 		{[]string{"file.with+meta(chars)"}, "file.with+meta(chars)", true},
 		{[]string{"file.with+meta(chars)"}, "fileXwith+meta(chars)", false},
