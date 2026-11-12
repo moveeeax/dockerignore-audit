@@ -2,6 +2,7 @@ package audit
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,7 +43,7 @@ func TestFlagsSecretsAndBloat(t *testing.T) {
 		t.Fatal("expected empty ignore (no .dockerignore)")
 	}
 	got := findingSet(findings)
-	for _, want := range []string{"server.pem", ".env", "node_modules/left-pad/index.js", ".git/config"} {
+	for _, want := range []string{"server.pem", ".env", "node_modules", ".git"} {
 		if _, ok := got[want]; !ok {
 			t.Errorf("expected finding for %q, got %v", want, keys(got))
 		}
@@ -52,6 +53,9 @@ func TestFlagsSecretsAndBloat(t *testing.T) {
 	}
 	if got["server.pem"].Severity != Danger || got[".env"].Severity != Danger {
 		t.Error("pem/.env must be danger severity")
+	}
+	if !got["node_modules"].Dir || !got[".git"].Dir {
+		t.Error("node_modules and .git must be reported as directories")
 	}
 }
 
@@ -107,7 +111,7 @@ func TestJSONShape(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	n := WriteJSON(&buf, findings, ig)
+	n := WriteJSON(&buf, findings, ig, nil)
 	if n != 1 {
 		t.Fatalf("want 1 finding, got %d", n)
 	}
@@ -128,7 +132,7 @@ func TestTextOKWhenClean(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	n := WriteText(&buf, findings, ig)
+	n := WriteText(&buf, findings, ig, nil)
 	if n != 0 || !bytes.Contains(buf.Bytes(), []byte("OK:")) {
 		t.Errorf("expected clean OK report, got n=%d out=%s", n, buf.String())
 	}
@@ -269,6 +273,111 @@ func TestSuggestionsExcludeTheFinding(t *testing.T) {
 		ig := mustIgnore(t, f.Rule)
 		if !ig.Ignored(f.Path) {
 			t.Errorf("suggested pattern %q does not exclude %q", f.Rule, f.Path)
+		}
+	}
+}
+
+func TestCollapsesDirectoryFindings(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "web/node_modules/a/index.js", "12345")
+	writeFile(t, dir, "web/node_modules/a/node_modules/b/index.js", "123")
+	writeFile(t, dir, "web/node_modules/a/README.md", "1")
+	writeFile(t, dir, "web/node_modules/a/test/fixture.pem", "pem")
+	writeFile(t, dir, "web/node_modules/a/app.log", "log")
+	writeFile(t, dir, ".dockerignore", "web/node_modules/**/*.md\n")
+	findings, _, err := Audit(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("want the directory and the key inside it, got %+v", findings)
+	}
+	got := findingSet(findings)
+	nm, ok := got["web/node_modules"]
+	if !ok || !nm.Dir || nm.Rule != "**/node_modules" || nm.Severity != Warn {
+		t.Fatalf("want one warn finding for web/node_modules, got %+v", findings)
+	}
+	// README.md is excluded; the other four files total 5+3+3+3 bytes.
+	if nm.Files != 4 || nm.Bytes != 14 {
+		t.Errorf("web/node_modules: files=%d bytes=%d, want 4 and 14", nm.Files, nm.Bytes)
+	}
+	if pem := got["web/node_modules/a/test/fixture.pem"]; pem.Severity != Danger || pem.Files != 1 || pem.Bytes != 3 {
+		t.Errorf("a key inside a collapsed directory must stay a danger finding, got %+v", pem)
+	}
+}
+
+func TestDirectoryFullyIgnoredBelowIsNotReported(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "vendor/m/m.go", "x")
+	writeFile(t, dir, ".dockerignore", "vendor/**\n")
+	findings, _, err := Audit(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Errorf("nothing under vendor/ reaches the builder, got %+v", findings)
+	}
+}
+
+func TestNegationInsideIgnoredDirectory(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "node_modules/keep.js", "x")
+	writeFile(t, dir, "node_modules/drop.js", "x")
+	writeFile(t, dir, ".dockerignore", "node_modules\n!node_modules/keep.js\n")
+	findings, _, err := Audit(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Path != "node_modules/keep.js" || findings[0].Dir {
+		t.Errorf("only the re-included file reaches the builder, got %+v", findings)
+	}
+}
+
+func TestDirectoryTextAndJSON(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "node_modules/a.js", "1234")
+	writeFile(t, dir, "node_modules/b.js", "1234")
+	writeFile(t, dir, "id_rsa", "12")
+	findings, ig, err := Audit(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var txt bytes.Buffer
+	WriteText(&txt, findings, ig, nil)
+	if !bytes.Contains(txt.Bytes(), []byte("[warn] node_modules/ (2 files, 8 B)")) {
+		t.Errorf("text report missing collapsed line:\n%s", txt.String())
+	}
+	var js bytes.Buffer
+	WriteJSON(&js, findings, ig, nil)
+	var rep struct {
+		Findings []struct {
+			Path  string `json:"path"`
+			Files int    `json:"files"`
+			Bytes int64  `json:"bytes"`
+		} `json:"findings"`
+		Size *json.RawMessage `json:"size"`
+	}
+	if err := json.Unmarshal(js.Bytes(), &rep); err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Findings) != 2 || rep.Findings[0].Path != "id_rsa" || rep.Findings[0].Files != 1 || rep.Findings[0].Bytes != 2 ||
+		rep.Findings[1].Path != "node_modules/" || rep.Findings[1].Files != 2 || rep.Findings[1].Bytes != 8 {
+		t.Errorf("unexpected JSON findings: %s", js.String())
+	}
+	if rep.Size != nil {
+		t.Error("size must be omitted without -size")
+	}
+}
+
+func TestHumanBytesAndDigits(t *testing.T) {
+	for n, want := range map[int64]string{0: "0 B", 999: "999 B", 1000: "1.0 kB", 184_200_000: "184.2 MB", 2_500_000_000: "2.5 GB"} {
+		if got := humanBytes(n); got != want {
+			t.Errorf("humanBytes(%d) = %q, want %q", n, got, want)
+		}
+	}
+	for n, want := range map[int]string{0: "0", 999: "999", 1000: "1,000", 12431: "12,431", 1234567: "1,234,567"} {
+		if got := groupDigits(n); got != want {
+			t.Errorf("groupDigits(%d) = %q, want %q", n, got, want)
 		}
 	}
 }
