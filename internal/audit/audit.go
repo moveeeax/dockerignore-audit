@@ -5,6 +5,7 @@ package audit
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -41,6 +42,9 @@ type Rule struct {
 	// suggest, when set, returns a pattern tailored to the matched path for
 	// rules that cover several names (id_rsa/id_ed25519, .env/.env.local, ...).
 	suggest func(rel string) string
+	// dir, when set, is a directory name the rule covers as a whole: a
+	// directory with this name is reported once instead of file by file.
+	dir string
 }
 
 // Suggestion returns the .dockerignore pattern to recommend for rel.
@@ -53,11 +57,18 @@ func (r Rule) Suggestion(rel string) string {
 
 // Finding is a concrete path that matched a rule and is not already ignored.
 type Finding struct {
+	// Path is slash-separated and relative to the context root.
 	Path string
+	// Dir is set when Path is a directory reported as a whole.
+	Dir bool
 	// Rule is the .dockerignore pattern that would exclude Path.
 	Rule     string
 	Why      string
 	Severity Severity
+	// Files and Bytes count what Path adds to the build context today: 1 and
+	// the file size for a file, the unignored files below it for a directory.
+	Files int
+	Bytes int64
 }
 
 func base(rel string) string { return path.Base(rel) }
@@ -94,30 +105,30 @@ func anyExt(rel string) string { return "**/*" + path.Ext(base(rel)) }
 // "**/" prefix, which matches any number of directories including zero.
 var Rules = []Rule{
 	{"**/*.pem", "private key or certificate — never ship in an image layer", Danger,
-		func(r string) bool { return hasExt(r, ".pem") }, nil},
+		func(r string) bool { return hasExt(r, ".pem") }, nil, ""},
 	{"**/*.key", "private key material", Danger,
-		func(r string) bool { return hasExt(r, ".key") }, nil},
+		func(r string) bool { return hasExt(r, ".key") }, nil, ""},
 	{"**/id_rsa", "SSH private key", Danger,
 		func(r string) bool {
 			b := base(r)
 			return b == "id_rsa" || b == "id_dsa" || b == "id_ecdsa" || b == "id_ed25519"
-		}, anyName},
+		}, anyName, ""},
 	{"**/.env", "environment file with secrets/config", Danger,
-		func(r string) bool { b := base(r); return b == ".env" || strings.HasPrefix(b, ".env.") }, anyName},
+		func(r string) bool { b := base(r); return b == ".env" || strings.HasPrefix(b, ".env.") }, anyName, ""},
 	{"**/*.p12", "PKCS#12 keystore", Danger,
-		func(r string) bool { return hasExt(r, ".p12", ".pfx") }, anyExt},
+		func(r string) bool { return hasExt(r, ".p12", ".pfx") }, anyExt, ""},
 	{"**/credentials", "cloud/CLI credentials file", Danger,
-		func(r string) bool { b := base(r); return b == "credentials" || b == ".netrc" || b == ".npmrc" }, anyName},
+		func(r string) bool { b := base(r); return b == "credentials" || b == ".netrc" || b == ".npmrc" }, anyName, ""},
 	{"**/.git", "full source history bloats context and can leak old secrets", Warn,
-		func(r string) bool { return hasSegment(r, ".git") }, nil},
+		func(r string) bool { return hasSegment(r, ".git") }, nil, ".git"},
 	{"**/node_modules", "reinstalled in the image; huge, slow context upload", Warn,
-		func(r string) bool { return hasSegment(r, "node_modules") }, nil},
+		func(r string) bool { return hasSegment(r, "node_modules") }, nil, "node_modules"},
 	{"**/vendor", "vendored deps usually restored during build", Warn,
-		func(r string) bool { return hasSegment(r, "vendor") }, nil},
+		func(r string) bool { return hasSegment(r, "vendor") }, nil, "vendor"},
 	{"**/*.log", "log noise in the context", Warn,
-		func(r string) bool { return hasExt(r, ".log") }, nil},
+		func(r string) bool { return hasExt(r, ".log") }, nil, ""},
 	{"**/Dockerfile", "the Dockerfile does not belong inside the image it builds", Warn,
-		func(r string) bool { b := base(r); return b == "Dockerfile" || strings.HasPrefix(b, "Dockerfile.") }, anyName},
+		func(r string) bool { b := base(r); return b == "Dockerfile" || strings.HasPrefix(b, "Dockerfile.") }, anyName, ""},
 	{"**/__pycache__", "compiled Python cache", Warn,
 		func(r string) bool { return hasSegment(r, "__pycache__") || hasExt(r, ".pyc") },
 		func(r string) string {
@@ -125,7 +136,7 @@ var Rules = []Rule{
 				return "**/__pycache__"
 			}
 			return "**/*.pyc"
-		}},
+		}, "__pycache__"},
 	{"**/.terraform", "provider plugins / local terraform cache", Warn,
 		func(r string) bool { return hasSegment(r, ".terraform") || hasExt(r, ".tfstate") },
 		func(r string) string {
@@ -133,9 +144,9 @@ var Rules = []Rule{
 				return "**/.terraform"
 			}
 			return "**/*.tfstate"
-		}},
+		}, ".terraform"},
 	{"**/.DS_Store", "macOS metadata", Warn,
-		func(r string) bool { return base(r) == ".DS_Store" }, nil},
+		func(r string) bool { return base(r) == ".DS_Store" }, nil, ""},
 }
 
 // Ignore holds parsed .dockerignore patterns.
@@ -166,8 +177,14 @@ func LoadIgnore(dir string) (*Ignore, error) {
 		return nil, err
 	}
 	defer f.Close()
+	return ParseIgnore(f)
+}
+
+// ParseIgnore reads .dockerignore content from r.
+func ParseIgnore(r io.Reader) (*Ignore, error) {
+	ig := &Ignore{}
 	first := true
-	sc := bufio.NewScanner(f)
+	sc := bufio.NewScanner(r)
 	for sc.Scan() {
 		line := sc.Text()
 		if first {
@@ -290,6 +307,32 @@ func (ig *Ignore) Ignored(rel string) bool {
 	return ignored
 }
 
+// hasNegation reports whether any "!" pattern exists. Without one, nothing
+// below an excluded directory can come back, so the walk can skip it.
+func (ig *Ignore) hasNegation() bool {
+	for _, p := range ig.patterns {
+		if p.negate {
+			return true
+		}
+	}
+	return false
+}
+
+// reincludedBy returns the "!" line that re-includes rel when the last
+// pattern matching rel is a negation, i.e. the user kept rel on purpose.
+func (ig *Ignore) reincludedBy(rel string) (string, bool) {
+	var last *ignorePat
+	for i := range ig.patterns {
+		if ig.patterns[i].matches(rel) {
+			last = &ig.patterns[i]
+		}
+	}
+	if last == nil || !last.negate {
+		return "", false
+	}
+	return "!" + last.raw, true
+}
+
 func (p ignorePat) matches(rel string) bool {
 	if p.re.MatchString(rel) {
 		return true
@@ -302,35 +345,84 @@ func (p ignorePat) matches(rel string) bool {
 	return false
 }
 
-// Audit walks dir and returns findings for context files that match a rule and
-// are not already excluded by .dockerignore. Findings are sorted most-severe first.
-func Audit(dir string) ([]Finding, *Ignore, error) {
-	ig, err := LoadIgnore(dir)
-	if err != nil {
-		return nil, nil, err
-	}
-	var out []Finding
-	err = filepath.Walk(dir, func(fp string, info os.FileInfo, werr error) error {
+// walkContext walks start, which is dir or a directory below it, and calls fn
+// for every directory and file that Docker would send from the build context
+// rooted at dir. rel is slash-separated and relative to dir. fn may return
+// filepath.SkipDir for a directory. Excluded directories are skipped unless a
+// "!" pattern could re-include something below them.
+func walkContext(dir, start string, ig *Ignore, fn func(rel string, info os.FileInfo) error) error {
+	negations := ig.hasNegation()
+	return filepath.Walk(start, func(fp string, info os.FileInfo, werr error) error {
 		if werr != nil {
 			return werr
-		}
-		if info.IsDir() {
-			return nil
 		}
 		rel, rerr := filepath.Rel(dir, fp)
 		if rerr != nil {
 			return nil
 		}
 		rel = filepath.ToSlash(rel)
-		if rel == ".dockerignore" {
+		if rel == "." {
 			return nil
 		}
 		if ig.Ignored(rel) {
+			if info.IsDir() && !negations {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		return fn(rel, info)
+	})
+}
+
+// Audit walks dir and returns findings for context paths that match a rule and
+// are not already excluded by .dockerignore. Findings are sorted most-severe first.
+//
+// A directory covered by a directory rule (node_modules, .git, ...) yields one
+// finding with the count and size of the files below it, and its files are
+// not reported one by one. Secrets found inside it still get their own danger
+// findings, so -danger-only keeps failing on them.
+func Audit(dir string) ([]Finding, *Ignore, error) {
+	ig, err := LoadIgnore(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	var out []Finding
+	err = walkContext(dir, dir, ig, func(rel string, info os.FileInfo) error {
+		if info.IsDir() {
+			for _, ru := range Rules {
+				if ru.dir == "" || ru.dir != base(rel) {
+					continue
+				}
+				d := Finding{Path: rel, Dir: true, Rule: ru.Suggestion(rel), Why: ru.Why, Severity: ru.Severity}
+				var secrets []Finding
+				err := walkContext(dir, filepath.Join(dir, filepath.FromSlash(rel)), ig, func(sub string, si os.FileInfo) error {
+					if si.IsDir() {
+						return nil
+					}
+					d.Files++
+					d.Bytes += si.Size()
+					if f, ok := dangerFinding(sub, si); ok {
+						secrets = append(secrets, f)
+					}
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+				if d.Files > 0 {
+					out = append(out, d)
+				}
+				out = append(out, secrets...)
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if rel == ".dockerignore" {
 			return nil
 		}
 		for _, ru := range Rules {
 			if ru.match(rel) {
-				out = append(out, Finding{Path: rel, Rule: ru.Suggestion(rel), Why: ru.Why, Severity: ru.Severity})
+				out = append(out, Finding{Path: rel, Rule: ru.Suggestion(rel), Why: ru.Why, Severity: ru.Severity, Files: 1, Bytes: info.Size()})
 				break
 			}
 		}
@@ -341,6 +433,20 @@ func Audit(dir string) ([]Finding, *Ignore, error) {
 	}
 	sortFindings(out)
 	return out, ig, nil
+}
+
+// dangerFinding checks a file inside a collapsed directory against the danger
+// rules only. Rules lists them first, so the scan stops at the first warning.
+func dangerFinding(rel string, info os.FileInfo) (Finding, bool) {
+	for _, ru := range Rules {
+		if ru.Severity != Danger {
+			break
+		}
+		if ru.match(rel) {
+			return Finding{Path: rel, Rule: ru.Suggestion(rel), Why: ru.Why, Severity: ru.Severity, Files: 1, Bytes: info.Size()}, true
+		}
+	}
+	return Finding{}, false
 }
 
 func sortFindings(f []Finding) {
